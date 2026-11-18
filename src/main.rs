@@ -1,115 +1,145 @@
-#![allow(clippy::collapsible_if, clippy::collapsible_else_if)]
-
+use ccp::config::{self, Settings};
 use ccp::daemon;
-use ccp::probe::{self, ProbeResult};
+use ccp::logger;
+use ccp::probe::{self, LoginError, ProbeResult};
 use ccp::state::DaemonState;
+use ccp::trust::{self, TrustStore, Verdict};
 use ccp::wifi;
 use std::env;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::io::{self, IsTerminal, Write};
+use std::path::Path;
+use std::process::ExitCode;
 use std::time::Duration;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
+type CliResult = Result<(), Box<dyn std::error::Error>>;
 
-    // 1. Save credentials: `ccp set`
-    if args.len() > 1 && args[1] == "set" {
-        let mut username = String::new();
+const USAGE: &str = "\
+ccp - campus captive portal auto-login
 
-        print!("Username: ");
-        io::stdout().flush()?;
-        io::stdin().read_line(&mut username)?;
+Usage:
+  ccp                              Log in now using saved credentials
+  ccp set                          Save username and password
+  ccp start | stop | status        Control the background daemon
+  ccp autostart enable [--now]     Start the daemon at every login (disable: ccp autostart disable)
+  ccp daemon [--once] [--dry-run]  Run the daemon loop in the foreground
+  ccp trust [HOST]                 Allow sending credentials to a portal (no HOST: approve the one the daemon blocked, or list)
+  ccp untrust HOST                 Stop trusting a portal
+  ccp wifi add|remove SSID         Let ccp (re)connect to this Wi-Fi network by itself
+  ccp wifi list | clear            Show / clear that list (empty = ccp never touches Wi-Fi)
+  ccp logs [-n N]                  Show the last N lines of the daemon log (default 30)
+  ccp --version | --help";
 
-        let username = username.trim();
-        let password = rpassword::prompt_password("Password: ")?;
-
-        if username.is_empty() || password.is_empty() {
-            eprintln!("Username and password cannot be empty.");
-            return Err("Username and password cannot be empty.".into());
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
         }
+    }
+}
 
-        let mut file = create_credentials_file()?;
+fn run() -> CliResult {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let dir = config::config_dir();
+    let rest = &args[args.len().min(1)..];
 
-        // Store credentials as raw text: username on line 1, password on line 2.
-        writeln!(file, "{}", username)?;
-        writeln!(file, "{}", password)?;
+    match args.first().map(String::as_str) {
+        None => login(&dir),
+        Some("set") => cmd_set(&dir),
+        Some("start") => cmd_start(&dir),
+        Some("stop") => daemon::stop_daemon(&dir).map_err(Into::into),
+        Some("status") => {
+            daemon::print_status(&dir);
+            Ok(())
+        }
+        Some("daemon") => cmd_daemon(&dir, rest),
+        Some("autostart") => cmd_autostart(&dir, rest),
+        Some("trust") => cmd_trust(&dir, rest),
+        Some("untrust") => cmd_untrust(&dir, rest),
+        Some("wifi") => cmd_wifi(&dir, rest),
+        Some("logs") => cmd_logs(&dir, rest),
+        Some("--version" | "-V" | "version") => {
+            println!("ccp {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        Some("--help" | "-h" | "help") => {
+            println!("{USAGE}");
+            Ok(())
+        }
+        Some(_) => {
+            eprintln!("{USAGE}");
+            Err("Invalid command line arguments.".into())
+        }
+    }
+}
 
-        // Reset daemon circuit breaker on new credentials
-        let state_path = get_config_dir().join("state.json");
-        DaemonState::reset_circuit_breaker(&state_path);
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
 
-        println!("Credentials saved successfully.");
-        return Ok(());
+fn cmd_set(dir: &Path) -> CliResult {
+    let mut username = String::new();
+
+    print!("Username: ");
+    io::stdout().flush()?;
+    io::stdin().read_line(&mut username)?;
+
+    let username = username.trim();
+    let password = rpassword::prompt_password("Password: ")?;
+
+    if username.is_empty() || password.is_empty() {
+        return Err("Username and password cannot be empty.".into());
     }
 
-    // 2. Start background daemon: `ccp start`
-    if args.len() > 1 && args[1] == "start" {
-        if let Err(e) = load_credentials() {
-            eprintln!("{e}");
-            return Err(e.into());
-        }
-        let config_dir = get_config_dir();
-        if let Err(e) = daemon::start_background_daemon(&config_dir) {
-            eprintln!("[ERROR] {e}");
-            return Err(e.into());
-        }
-        return Ok(());
+    config::save_credentials(dir, username, &password)?;
+
+    // Reset daemon circuit breaker on new credentials
+    DaemonState::reset_circuit_breaker(&dir.join("state.json"));
+
+    println!("Credentials saved successfully.");
+    if TrustStore::open(dir).hosts().is_empty() {
+        println!(
+            "Next: connect to your campus Wi-Fi and run `ccp` once. It will ask you to approve your login portal."
+        );
     }
+    Ok(())
+}
 
-    // 3. Stop background daemon: `ccp stop`
-    if args.len() > 1 && args[1] == "stop" {
-        let config_dir = get_config_dir();
-        if let Err(e) = daemon::stop_daemon(&config_dir) {
-            eprintln!("[ERROR] {e}");
-            return Err(e.into());
-        }
-        return Ok(());
+fn cmd_start(dir: &Path) -> CliResult {
+    config::load_credentials(dir)?;
+    daemon::start_background_daemon(dir).map_err(Into::into)
+}
+
+fn cmd_daemon(dir: &Path, args: &[String]) -> CliResult {
+    let creds = config::load_credentials(dir)?;
+
+    let once = args.iter().any(|a| a == "--once");
+    let dry_run = args.iter().any(|a| a == "--dry-run");
+
+    if let Err(e) = daemon::run_daemon(dir, &creds.username, &creds.password, once, dry_run) {
+        // The daemon's stderr is detached, so leave a trace in the log too.
+        logger::log(dir, &format!("Daemon error: {e}"));
+        return Err(e.into());
     }
+    Ok(())
+}
 
-    // 4. Print status: `ccp status`
-    if args.len() > 1 && args[1] == "status" {
-        let config_dir = get_config_dir();
-        daemon::print_status(&config_dir);
-        return Ok(());
-    }
+fn cmd_autostart(dir: &Path, args: &[String]) -> CliResult {
+    let usage_err = || -> CliResult {
+        eprintln!("Usage: ccp autostart [enable [--now]|disable]");
+        Err("Invalid autostart arguments.".into())
+    };
 
-    // 5. Run daemon loop: `ccp daemon [--once] [--dry-run]`
-    if args.len() > 1 && args[1] == "daemon" {
-        let (username, password) = match load_credentials() {
-            Ok(creds) => creds,
-            Err(e) => {
-                eprintln!("{e}");
-                return Err(e.into());
-            }
-        };
-
-        let once = args.iter().any(|arg| arg == "--once");
-        let dry_run = args.iter().any(|arg| arg == "--dry-run");
-
-        let config_dir = get_config_dir();
-        if let Err(e) = daemon::run_daemon(&config_dir, &username, &password, once, dry_run) {
-            eprintln!("[ERROR] Daemon error: {e}");
-            return Err(e.into());
-        }
-        return Ok(());
-    }
-
-    // 6. Autostart configuration: `ccp autostart [enable [--now]|disable]`
-    if args.len() > 1 && args[1] == "autostart" {
-        let config_dir = get_config_dir();
-        if args.len() > 2 && args[2] == "enable" {
+    match args.first().map(String::as_str) {
+        Some("enable") => {
             let start_now = args.iter().any(|a| a == "--now" || a == "-n");
-            if let Err(e) = daemon::set_autostart(&config_dir, true) {
-                eprintln!("[ERROR] {e}");
-                return Err(e.into());
-            }
+            daemon::set_autostart(dir, true)?;
 
             if start_now {
-                if let Err(e) = daemon::start_background_daemon(&config_dir) {
-                    eprintln!("[ERROR] Failed to start background daemon: {e}");
-                    return Err(e.into());
-                }
+                daemon::start_background_daemon(dir)
+                    .map_err(|e| format!("Failed to start background daemon: {e}"))?;
             } else {
                 println!(
                     "Auto-start configured. The daemon will automatically launch on your next system restart/login."
@@ -118,35 +148,167 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Tip: Run 'ccp start' or use 'ccp autostart enable --now' to start the daemon immediately."
                 );
             }
-        } else if args.len() > 2 && args[2] == "disable" {
-            if let Err(e) = daemon::set_autostart(&config_dir, false) {
-                eprintln!("[ERROR] {e}");
-                return Err(e.into());
-            }
-        } else {
-            eprintln!("Usage: ccp autostart [enable [--now]|disable]");
-            return Err("Invalid autostart arguments.".into());
+            Ok(())
         }
-        return Ok(());
+        Some("disable") => daemon::set_autostart(dir, false).map_err(Into::into),
+        _ => usage_err(),
+    }
+}
+
+fn cmd_trust(dir: &Path, args: &[String]) -> CliResult {
+    let store = TrustStore::open(dir);
+
+    match args.first().map(String::as_str) {
+        Some("--list" | "list") => print_trusted(&store),
+        Some(target) => {
+            let host = trust::host_of(target).ok_or("That doesn't look like a host or URL.")?;
+            if store.add(&host)? {
+                println!("Trusted {host}. Credentials may now be sent to it.");
+            } else {
+                println!("{host} was already trusted.");
+            }
+        }
+        None => {
+            let state = DaemonState::load(&dir.join("state.json"));
+            match state
+                .pending_untrusted_gateway
+                .filter(|h| !store.is_trusted(h))
+            {
+                Some(host) => {
+                    println!("The background daemon found a login portal it did not trust: {host}");
+                    println!(
+                        "Only approve it if it is really your campus network: your password will be sent to it."
+                    );
+                    if confirm(&format!("Trust {host}?")) {
+                        store.add(&host)?;
+                        println!(
+                            "Trusted {host}. The daemon will pick this up within ~30 seconds."
+                        );
+                    } else {
+                        println!("Not trusted.");
+                    }
+                }
+                None => print_trusted(&store),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_trusted(store: &TrustStore) {
+    let hosts = store.hosts();
+    if hosts.is_empty() {
+        println!("No trusted portals yet. Run `ccp` on campus Wi-Fi to approve one.");
+    } else {
+        println!("Trusted portals (credentials may be sent to these):");
+        for h in hosts {
+            println!("  {h}");
+        }
+    }
+}
+
+fn cmd_untrust(dir: &Path, args: &[String]) -> CliResult {
+    let Some(target) = args.first() else {
+        eprintln!("Usage: ccp untrust HOST");
+        return Err("Missing host.".into());
+    };
+    if TrustStore::open(dir).remove(target)? {
+        println!("No longer trusting {target}.");
+    } else {
+        println!("{target} was not in the trusted list.");
+    }
+    Ok(())
+}
+
+fn cmd_wifi(dir: &Path, args: &[String]) -> CliResult {
+    let mut settings = Settings::load(dir);
+    let name = args.get(1..).unwrap_or(&[]).join(" ");
+
+    match args.first().map(String::as_str) {
+        Some("add") if !name.is_empty() => {
+            if settings.add_ssid(&name) {
+                settings.save(dir)?;
+                println!("ccp may now reconnect to \"{name}\" by itself.");
+            } else {
+                println!("\"{name}\" is already in the list.");
+            }
+        }
+        Some("remove") if !name.is_empty() => {
+            if settings.remove_ssid(&name) {
+                settings.save(dir)?;
+                println!("Removed \"{name}\".");
+            } else {
+                println!("\"{name}\" was not in the list.");
+            }
+        }
+        Some("clear") => {
+            settings.wifi_ssids.clear();
+            settings.save(dir)?;
+            println!("Wi-Fi auto-join is now off.");
+        }
+        Some("list") | None => {
+            if settings.wifi_ssids.is_empty() {
+                println!("Wi-Fi auto-join is off. ccp never connects to Wi-Fi on its own.");
+                println!("Enable it for your campus network: ccp wifi add \"<SSID>\"");
+            } else {
+                println!("ccp may reconnect to (in this order):");
+                for s in &settings.wifi_ssids {
+                    println!("  {s}");
+                }
+            }
+        }
+        _ => {
+            eprintln!("Usage: ccp wifi add|remove SSID | ccp wifi list | ccp wifi clear");
+            return Err("Invalid wifi arguments.".into());
+        }
+    }
+    Ok(())
+}
+
+fn cmd_logs(dir: &Path, args: &[String]) -> CliResult {
+    let n = args
+        .iter()
+        .position(|a| a == "-n")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(30);
+
+    let lines = logger::tail(dir, n);
+    if lines.is_empty() {
+        println!(
+            "No log entries yet. (The daemon writes to {})",
+            dir.join(logger::LOG_FILE).display()
+        );
+    } else {
+        for line in lines {
+            println!("{line}");
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// One-shot login (`ccp`)
+// ---------------------------------------------------------------------------
+
+fn login(dir: &Path) -> CliResult {
+    let creds = config::load_credentials(dir)?;
+
+    let state_path = dir.join("state.json");
+    if DaemonState::load(&state_path).halted_bad_credentials {
+        let msg = "Automatic login is paused because the portal rejected your credentials. \
+                   Run `ccp set` to update them (this also resumes the daemon).";
+        return Err(msg.into());
     }
 
-    // Default (args.len() == 1): load saved credentials and authenticate immediately
-    if args.len() == 1 {
-        let (username, password) = match load_credentials() {
-            Ok(creds) => creds,
-            Err(e) => {
-                eprintln!("{e}");
-                return Err(e.into());
-            }
-        };
+    let cached_gateway = get_cached_gateway(dir);
+    let probe_client = probe::build_fast_client(false)?;
+    let login_client = probe::build_login_client()?;
+    let mut tried_wifi = false;
 
-        let cached_gateway = get_cached_gateway();
-        let client = probe::build_fast_client(false)?;
-
-        // Execute zero-lag probe pipeline
-        let probe_result = probe::probe_network(&client, cached_gateway.as_deref());
-
-        match probe_result {
+    loop {
+        // Zero-lag probe pipeline
+        match probe::probe_network(&probe_client, cached_gateway.as_deref()) {
             ProbeResult::OnlineUnlocked => {
                 println!("Already connected and authenticated!");
                 return Ok(());
@@ -156,211 +318,114 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gateway_base,
                 login_xml_url,
             } => {
-                println!("Portal detected at: {}", gateway_base);
-                probe::post_login(&client, &login_xml_url, &username, &password)?;
-                set_cached_gateway(&login_xml_url);
-                return Ok(());
+                println!("Portal detected at: {gateway_base}");
+                ensure_trusted(dir, &login_xml_url)?;
+
+                println!("Authenticating at: {login_xml_url}");
+                return match probe::login_and_verify(
+                    &login_client,
+                    &probe_client,
+                    &login_xml_url,
+                    &creds.username,
+                    &creds.password,
+                ) {
+                    Ok(msg) => {
+                        set_cached_gateway(dir, &login_xml_url);
+                        println!("Logged in: internet is reachable. ({msg})");
+                        Ok(())
+                    }
+                    Err(LoginError::BadCredentials(msg)) => {
+                        DaemonState::mark_bad_credentials(
+                            &state_path,
+                            &format!("Halted (bad credentials): {msg}"),
+                        );
+                        Err(format!(
+                            "{msg}\nAutomatic login is now paused so your account isn't locked out. Run `ccp set` with the correct password."
+                        )
+                        .into())
+                    }
+                    Err(e) => Err(e.into()),
+                };
             }
 
             ProbeResult::InterfaceOffline => {
-                println!("Wi-Fi interface offline or disconnected. Connecting to Wi-Fi...");
-                if let Err(e) = wifi::connect_wifi(None) {
-                    eprintln!("Wi-Fi connection command error: {}", e);
+                let ssids = Settings::load(dir).wifi_ssids;
+                if tried_wifi || ssids.is_empty() {
+                    let msg = if ssids.is_empty() {
+                        "Not connected to any network. Connect to your campus Wi-Fi, or run `ccp wifi add \"<SSID>\"` so ccp can do it for you."
+                    } else {
+                        "Interface still offline after Wi-Fi connect attempt."
+                    };
+                    return Err(msg.into());
                 }
+                tried_wifi = true;
+
+                println!("Wi-Fi interface offline or disconnected. Connecting to Wi-Fi...");
+                let _ = wifi::connect_allowed(&ssids);
 
                 print!("Waiting for IPv4 route...");
                 io::stdout().flush()?;
                 match wifi::wait_for_ipv4(Duration::from_millis(6000), Duration::from_millis(200)) {
-                    Some(ip) => {
-                        println!(" Connected ({})", ip);
-                        let post_connect_probe =
-                            probe::probe_network(&client, cached_gateway.as_deref());
-                        match post_connect_probe {
-                            ProbeResult::OnlineUnlocked => {
-                                println!("Already connected and authenticated!");
-                                return Ok(());
-                            }
-                            ProbeResult::LockedPortal {
-                                gateway_base,
-                                login_xml_url,
-                            } => {
-                                println!("Portal detected at: {}", gateway_base);
-                                probe::post_login(&client, &login_xml_url, &username, &password)?;
-                                set_cached_gateway(&login_xml_url);
-                                return Ok(());
-                            }
-                            ProbeResult::InterfaceOffline => {
-                                eprintln!("Interface still offline after Wi-Fi connect attempt.");
-                                return Err(
-                                    "Interface still offline after Wi-Fi connect attempt.".into()
-                                );
-                            }
-                            ProbeResult::ProbeTimeoutOrError(e) => {
-                                eprintln!("Probe failed after Wi-Fi connect: {}", e);
-                                return Err(e.into());
-                            }
-                        }
-                    }
+                    Some(ip) => println!(" Connected ({ip})"),
                     None => {
-                        eprintln!(" Timed out waiting for IPv4 route.");
+                        println!();
                         return Err("Timed out waiting for IPv4 route.".into());
                     }
                 }
             }
 
             ProbeResult::ProbeTimeoutOrError(err_msg) => {
-                eprintln!("Network probe error: {}", err_msg);
-                return Err(err_msg.into());
+                return Err(format!("Network probe error: {err_msg}").into());
             }
         }
     }
-
-    eprintln!("Usage:");
-    eprintln!("  ccp                          Authenticate using saved credentials");
-    eprintln!("  ccp set                      Save username and password");
-    eprintln!("  ccp start                    Start autonomous background daemon");
-    eprintln!("  ccp stop                     Stop running background daemon");
-    eprintln!("  ccp status                   Display daemon state and health status");
-    eprintln!("  ccp daemon [--once] [--dry-run]  Run daemon loop in foreground");
-    eprintln!("  ccp autostart [enable [--now]|disable] Enable/disable OS boot startup");
-
-    Err("Invalid command line arguments.".into())
 }
 
-fn load_credentials() -> Result<(String, String), String> {
-    let path = credentials_path();
+/// Credentials only go to portals the user approved. Interactive runs can approve on
+/// the spot; non-interactive ones (scripts, the daemon) must use `ccp trust`.
+fn ensure_trusted(dir: &Path, login_url: &str) -> CliResult {
+    let Verdict::Untrusted { host } = trust::check(dir, login_url) else {
+        return Ok(());
+    };
 
-    if !Path::new(&path).exists() {
-        return Err("Credentials not found. Run `ccp set` first.".to_string());
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        let msg = format!(
+            "Portal host {host} is not trusted. Run `ccp trust {host}` to allow sending your credentials to it."
+        );
+        return Err(msg.into());
     }
 
-    let mut file = File::open(&path).map_err(|e| format!("Failed to open credentials: {e}"))?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)
-        .map_err(|e| format!("Failed to read credentials: {e}"))?;
-
-    let mut lines = contents.lines();
-    let username = lines.next().unwrap_or("").trim().to_string();
-    let password = lines.next().unwrap_or("").trim().to_string();
-
-    if username.is_empty() || password.is_empty() {
-        return Err("Username or password missing in credentials file.".to_string());
-    }
-
-    Ok((username, password))
-}
-
-fn credentials_path() -> PathBuf {
-    // 1. Check legacy $HOME/.config/ccp/credentials.txt (exact original main branch path)
-    if let Ok(home) = env::var("HOME") {
-        let legacy = PathBuf::from(home)
-            .join(".config")
-            .join("ccp")
-            .join("credentials.txt");
-        if legacy.exists() {
-            return legacy;
-        }
-    }
-
-    // 2. Check dirs::home_dir()/.config/ccp/credentials.txt
-    if let Some(home) = dirs::home_dir() {
-        let p = home.join(".config").join("ccp").join("credentials.txt");
-        if p.exists() {
-            return p;
-        }
-    }
-
-    // 3. Check dirs::config_dir()/ccp/credentials.txt
-    if let Some(config_dir) = dirs::config_dir() {
-        let p = config_dir.join("ccp").join("credentials.txt");
-        if p.exists() {
-            return p;
-        }
-    }
-
-    // 4. Check %USERPROFILE%/.config/ccp/credentials.txt
-    if let Ok(profile) = env::var("USERPROFILE") {
-        let p = PathBuf::from(profile)
-            .join(".config")
-            .join("ccp")
-            .join("credentials.txt");
-        if p.exists() {
-            return p;
-        }
-    }
-
-    // Default destination for writing new credentials:
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".config")
-            .join("ccp")
-            .join("credentials.txt");
-    }
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".config").join("ccp").join("credentials.txt");
-    }
-    if let Ok(profile) = env::var("USERPROFILE") {
-        return PathBuf::from(profile)
-            .join(".config")
-            .join("ccp")
-            .join("credentials.txt");
-    }
-
-    PathBuf::from(".config/ccp/credentials.txt")
-}
-
-fn get_config_dir() -> PathBuf {
-    let creds = credentials_path();
-    if let Some(parent) = creds.parent() {
-        parent.to_path_buf()
+    println!();
+    println!("The login portal at {host} is not in your trusted list.");
+    println!(
+        "Only continue if this is your campus network: your username and password will be sent to it."
+    );
+    if confirm(&format!("Trust {host} and log in?")) {
+        TrustStore::open(dir).add(&host)?;
+        println!("Trusted {host}.");
+        Ok(())
     } else {
-        PathBuf::from(".config/ccp")
+        Err("Login cancelled: portal not trusted.".into())
     }
 }
 
-fn cached_gateway_path() -> PathBuf {
-    get_config_dir().join("cached_gateway.txt")
+fn confirm(question: &str) -> bool {
+    print!("{question} [y/N]: ");
+    let _ = io::stdout().flush();
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-fn get_cached_gateway() -> Option<String> {
-    let path = cached_gateway_path();
-    let content = fs::read_to_string(path).ok()?;
+fn get_cached_gateway(dir: &Path) -> Option<String> {
+    let content = fs::read_to_string(dir.join("cached_gateway.txt")).ok()?;
     let trimmed = content.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-fn set_cached_gateway(gateway: &str) {
-    let path = cached_gateway_path();
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = fs::write(path, gateway);
-}
-
-fn create_credentials_file() -> std::io::Result<File> {
-    let path = credentials_path();
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-    }
-
-    #[cfg(not(unix))]
-    {
-        File::create(path)
-    }
+fn set_cached_gateway(dir: &Path, gateway: &str) {
+    let _ = fs::create_dir_all(dir);
+    let _ = fs::write(dir.join("cached_gateway.txt"), gateway);
 }

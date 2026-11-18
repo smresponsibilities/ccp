@@ -68,13 +68,8 @@ pub fn current_local_ipv4() -> Option<Ipv4Addr> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("1.1.1.1:80").ok()?;
     match socket.local_addr().ok()?.ip() {
-        IpAddr::V4(ip)
-            if !ip.is_loopback()
-                && !ip.is_link_local()
-                && !(ip.octets()[0] == 169 && ip.octets()[1] == 254) =>
-        {
-            Some(ip)
-        }
+        // `is_link_local` already covers 169.254.0.0/16 (APIPA "no DHCP" addresses).
+        IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_link_local() => Some(ip),
         _ => None,
     }
 }
@@ -159,22 +154,44 @@ pub fn is_gateway_reachable(gateway: &str) -> bool {
     false
 }
 
-/// Builds a zero-lag HTTP client configured identically to Firefox's URLFetcher
-pub fn build_fast_client(follow_redirects: bool) -> Result<Client, reqwest::Error> {
+fn client_builder(
+    follow_redirects: bool,
+    connect_timeout: Duration,
+    total_timeout: Duration,
+) -> reqwest::blocking::ClientBuilder {
     Client::builder()
         .no_proxy() // Bypass Windows WinHTTP / WPAD proxy lag
         .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) // Force IPv4 (no AAAA timeout)
         .tcp_nodelay(true)
         .pool_max_idle_per_host(0) // Matches Firefox LOAD_FRESH_CONNECTION
-        .danger_accept_invalid_certs(true) // Campus portals use self-signed certs
+        // Campus portals use self-signed certificates. Credentials are only ever sent
+        // to hosts in the trust list (see `trust`), which limits the exposure to an
+        // on-path attacker impersonating a gateway you already trust.
+        .danger_accept_invalid_certs(true)
         .redirect(if follow_redirects {
             Policy::limited(3)
         } else {
             Policy::none() // Matches Firefox redirectionLimit = 0
         })
-        .connect_timeout(Duration::from_millis(1200))
-        .timeout(Duration::from_millis(2500))
-        .build()
+        .connect_timeout(connect_timeout)
+        .timeout(total_timeout)
+}
+
+/// Builds a zero-lag HTTP client configured identically to Firefox's URLFetcher
+/// (short timeouts: this is for connectivity probes, not for logging in).
+pub fn build_fast_client(follow_redirects: bool) -> Result<Client, reqwest::Error> {
+    client_builder(
+        follow_redirects,
+        Duration::from_millis(1200),
+        Duration::from_millis(2500),
+    )
+    .build()
+}
+
+/// Client for the login POST. Portals under load can take several seconds to answer,
+/// so this is more patient than the probe client.
+pub fn build_login_client() -> Result<Client, reqwest::Error> {
+    client_builder(false, Duration::from_secs(3), Duration::from_secs(10)).build()
 }
 
 fn is_ignored_host(host: &str) -> bool {
@@ -690,8 +707,133 @@ pub fn submit_login_post(
     }
 }
 
-/// Authenticates to the captive portal with auto-retry to HTTPS if initial HTTP fails,
-/// and validates the portal response body and status code.
+/// Why a login attempt did not end with working internet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginError {
+    /// The portal rejected the username/password (or says the account is unusable).
+    /// Retrying with the same credentials can only risk a lockout.
+    BadCredentials(String),
+    /// The portal refused for another reason (session limit, transient error, ...).
+    Rejected(String),
+    /// The request failed before the portal gave a verdict (timeout, refused, ...).
+    Network(String),
+    /// The portal answered "OK" but the network is still behind it afterwards.
+    StillLocked,
+}
+
+impl std::fmt::Display for LoginError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoginError::BadCredentials(m) | LoginError::Rejected(m) => write!(f, "{m}"),
+            LoginError::Network(m) => write!(f, "Network error during login: {m}"),
+            LoginError::StillLocked => write!(
+                f,
+                "The portal accepted the login but the internet is still locked"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LoginError {}
+
+/// `true` when a portal rejection message means the credentials themselves are bad, as
+/// opposed to a transient problem. This is what trips the daemon's circuit breaker.
+pub fn is_credential_rejection(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    [
+        "invalid username",
+        "invalid user name",
+        "invalid password",
+        "incorrect password",
+        "wrong password",
+        "invalid credentials",
+        "make sure your password is correct",
+        "authentication failed",
+        "login failed",
+        "account expired",
+        "access denied",
+        "portal returned fail status",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+}
+
+/// POSTs the credentials and interprets the portal's answer. Does **not** check that
+/// the internet actually came up; use [`login_and_verify`] for that.
+///
+/// If a plain-HTTP portal refuses the connection, one HTTPS retry is made (never the
+/// other way round, and never after a timeout, to avoid double-submitting).
+pub fn attempt_login(
+    client: &Client,
+    login_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, LoginError> {
+    let resp = match submit_login_post(client, login_url, username, password) {
+        Ok(r) => r,
+        Err(e) if e.is_connect() && login_url.starts_with("http://") => {
+            let https_url = login_url.replacen("http://", "https://", 1);
+            submit_login_post(client, &https_url, username, password)
+                .map_err(|e2| LoginError::Network(format!("{e}; HTTPS retry also failed: {e2}")))?
+        }
+        Err(e) => return Err(LoginError::Network(e.to_string())),
+    };
+
+    let status = resp.status().as_u16();
+    let body = resp.text().unwrap_or_default();
+
+    validate_portal_response(status, &body).map_err(|msg| {
+        if is_credential_rejection(&msg) {
+            LoginError::BadCredentials(msg)
+        } else {
+            LoginError::Rejected(msg)
+        }
+    })
+}
+
+/// Polls `probe_target` until the network reports "unlocked" or attempts run out.
+/// Portals often take a moment to open the firewall after a successful login.
+pub fn wait_until_unlocked(
+    client: &Client,
+    probe_target: &str,
+    attempts: u32,
+    delay: Duration,
+) -> bool {
+    for attempt in 0..attempts {
+        if probe_url(client, probe_target, None) == ProbeResult::OnlineUnlocked {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(delay);
+        }
+    }
+    false
+}
+
+/// Confirms the internet is really reachable (about 4 seconds of patience).
+pub fn verify_unlocked(client: &Client) -> bool {
+    wait_until_unlocked(client, &probe_target_url(), 6, Duration::from_millis(700))
+}
+
+/// Logs in, then proves it worked. A portal page that merely *looks* successful no
+/// longer counts as success: it must be followed by a working connection.
+pub fn login_and_verify(
+    login_client: &Client,
+    probe_client: &Client,
+    login_url: &str,
+    username: &str,
+    password: &str,
+) -> Result<String, LoginError> {
+    let message = attempt_login(login_client, login_url, username, password)?;
+    if verify_unlocked(probe_client) {
+        Ok(message)
+    } else {
+        Err(LoginError::StillLocked)
+    }
+}
+
+/// Authenticates and prints progress (CLI-friendly wrapper around [`attempt_login`]).
+/// Prefer [`login_and_verify`] in new code.
 pub fn post_login(
     client: &Client,
     login_xml_url: &str,
@@ -699,38 +841,14 @@ pub fn post_login(
     password: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!("Authenticating at: {}", login_xml_url);
-
-    let result = submit_login_post(client, login_xml_url, username, password);
-    let resp = match result {
-        Ok(r) => r,
-        Err(e) => {
-            // HTTPS upgrade retry only for http:// (never downgrade https:// to http://)
-            if login_xml_url.starts_with("http://") {
-                let https_url = login_xml_url.replacen("http://", "https://", 1);
-                println!(
-                    "Initial POST failed ({}), retrying with HTTPS: {}",
-                    e, https_url
-                );
-                submit_login_post(client, &https_url, username, password)?
-            } else {
-                return Err(Box::new(e));
-            }
-        }
-    };
-
-    let status = resp.status();
-    let body = resp.text().unwrap_or_default();
-    println!("HTTP Status: {}", status.as_u16());
-
-    match validate_portal_response(status.as_u16(), &body) {
+    match attempt_login(client, login_xml_url, username, password) {
         Ok(msg) => {
             println!("Login request completed: {}", msg);
-            println!("Check your internet connection to confirm authentication.");
             Ok(())
         }
-        Err(err_msg) => {
-            eprintln!("{}", err_msg);
-            Err(err_msg.into())
+        Err(e) => {
+            eprintln!("{e}");
+            Err(Box::new(e))
         }
     }
 }

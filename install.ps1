@@ -11,7 +11,10 @@ $ErrorActionPreference = 'Stop'
 $BinaryName = "ccp.exe"
 $AssetName = "ccp-windows-amd64.zip"
 
-if ($Version) {
+# CCP_DOWNLOAD_BASE lets you install from a mirror (or a local server when testing).
+if ($env:CCP_DOWNLOAD_BASE) {
+    $DownloadUrl = $env:CCP_DOWNLOAD_BASE.TrimEnd('/') + "/$AssetName"
+} elseif ($Version) {
     $DownloadUrl = "https://github.com/$Repo/releases/download/$Version/$AssetName"
 } else {
     $DownloadUrl = "https://github.com/$Repo/releases/latest/download/$AssetName"
@@ -33,6 +36,26 @@ try {
     if (-not (Test-Path $ArchiveFile)) {
         Write-Error "[ERROR] Download failed: archive file was not found."
         exit 1
+    }
+
+    # Verify the download against the SHA-256 published next to it. This catches corrupted
+    # or tampered downloads; it cannot protect against a compromised GitHub account, since
+    # the checksum comes from the same release.
+    if ($env:CCP_SKIP_VERIFY -eq '1') {
+        Write-Host "[WARN] Skipping checksum verification (CCP_SKIP_VERIFY=1)." -ForegroundColor Yellow
+    } else {
+        $ChecksumFile = "$ArchiveFile.sha256"
+        try {
+            Invoke-WebRequest -Uri "$DownloadUrl.sha256" -OutFile $ChecksumFile -UseBasicParsing
+        } catch {
+            throw "[ERROR] Could not download the checksum file ($DownloadUrl.sha256). Refusing to install an unverified binary. Set CCP_SKIP_VERIFY=1 to override."
+        }
+        $Expected = ((Get-Content -Path $ChecksumFile -Raw).Trim() -split '\s+')[0].ToLower()
+        $Actual = (Get-FileHash -Path $ArchiveFile -Algorithm SHA256).Hash.ToLower()
+        if ($Expected -ne $Actual) {
+            throw "[ERROR] Checksum mismatch for $AssetName. Not installing. Expected $Expected but got $Actual."
+        }
+        Write-Host "[OK] Checksum verified." -ForegroundColor Green
     }
 
     Expand-Archive -Path $ArchiveFile -DestinationPath $TempDir -Force
@@ -76,7 +99,10 @@ try {
     }
 
     Write-Host ""
-    Write-Host "Run 'ccp set' to configure credentials or 'ccp' to log in." -ForegroundColor Cyan
+    Write-Host "Next steps:" -ForegroundColor Cyan
+    Write-Host "  1. ccp set                      (save your campus username and password)" -ForegroundColor Cyan
+    Write-Host "  2. ccp                          (log in once on campus Wi-Fi and approve your portal)" -ForegroundColor Cyan
+    Write-Host "  3. ccp autostart enable --now   (keep it logged in automatically)" -ForegroundColor Cyan
 }
 finally {
     if (Test-Path $TempDir) {

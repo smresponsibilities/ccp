@@ -75,9 +75,11 @@ fn test_integration_state_atomic_and_circuit_breaker() {
         active_gateway: Some("http://10.1.1.9:8090/login.xml".to_string()),
         last_local_ip: Some("10.1.1.50".to_string()),
         failure_streak: 4,
+        still_locked_streak: 0,
         halted_bad_credentials: true,
         last_status_message: "Halted (bad credentials)".to_string(),
         total_logins: 12,
+        pending_untrusted_gateway: None,
     };
 
     assert!(state.save_atomic(&state_file).is_ok());
@@ -147,6 +149,10 @@ fn test_integration_daemon_circuit_breaker_on_bad_password() {
     let tmp_dir =
         std::env::temp_dir().join(format!("ccp_test_circuit_breaker_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp_dir);
+    // Credentials may only go to trusted portals; the mock portal listens on 127.0.0.1.
+    ccp::trust::TrustStore::open(&tmp_dir)
+        .add("127.0.0.1")
+        .unwrap();
 
     unsafe {
         std::env::set_var("CCP_PROBE_URL", &probe_url_str);
@@ -245,10 +251,23 @@ fn test_integration_daemon_live_credential_reload() {
             let _ = stream2.write_all(login_response.as_bytes());
             let _ = stream2.flush();
         }
+
+        // Step 3: after a "successful" login the daemon re-probes to prove the internet is up
+        if let Ok((mut stream3, _)) = listener.accept() {
+            let _ = read_full_http_request(&mut stream3);
+            let _ = stream3.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nsuccess\n",
+            );
+            let _ = stream3.flush();
+        }
     });
 
     let tmp_dir = std::env::temp_dir().join(format!("ccp_test_live_creds_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp_dir);
+    // Credentials may only go to trusted portals; the mock portal listens on 127.0.0.1.
+    ccp::trust::TrustStore::open(&tmp_dir)
+        .add("127.0.0.1")
+        .unwrap();
 
     // Write updated credentials.txt to config_dir
     let creds_path = tmp_dir.join("credentials.txt");
@@ -309,6 +328,10 @@ fn test_integration_daemon_expanded_circuit_breaker_keywords() {
 
     let tmp_dir = std::env::temp_dir().join(format!("ccp_test_exp_breaker_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&tmp_dir);
+    // Credentials may only go to trusted portals; the mock portal listens on 127.0.0.1.
+    ccp::trust::TrustStore::open(&tmp_dir)
+        .add("127.0.0.1")
+        .unwrap();
 
     unsafe {
         std::env::set_var("CCP_PROBE_URL", &probe_url_str);

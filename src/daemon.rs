@@ -1,6 +1,9 @@
+use crate::config::{self, Settings};
 use crate::instance::{self, SingleInstanceLock};
-use crate::probe::{self, ProbeResult};
+use crate::logger;
+use crate::probe::{self, LoginError, ProbeResult};
 use crate::state::DaemonState;
+use crate::trust::{self, TrustStore, Verdict};
 use crate::wifi;
 use std::path::Path;
 use std::time::Duration;
@@ -13,23 +16,38 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(target_os = "windows")]
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 
+/// Loop period. Roam detection is a local, zero-packet check, so this is cheap.
+const TICK: Duration = Duration::from_secs(2);
+/// If more wall-clock time than this passed between two ticks, the machine slept.
+const WAKE_GAP_SECS: u64 = 10;
+/// Consecutive "portal said OK, internet still locked" results before giving up.
+const MAX_STILL_LOCKED: u32 = 3;
+/// Ticks between Wi-Fi reconnect attempts: starts at ~10 s, backs off to ~2 min.
+const RECONNECT_MIN_TICKS: u32 = 5;
+const RECONNECT_MAX_TICKS: u32 = 60;
+
+/// Seconds to wait before the next automatic probe after `failure_streak` failures:
+/// 5, 10, 20, 40, 80, 160, then 300 s.
+pub fn backoff_secs(failure_streak: u32) -> u64 {
+    300u64.min(5 * (1u64 << failure_streak.saturating_sub(1).min(6)))
+}
+
 fn load_latest_credentials(
     config_dir: &Path,
     default_user: &str,
     default_pass: &str,
 ) -> (String, String) {
-    let creds_file = config_dir.join("credentials.txt");
-    if let Ok(contents) = std::fs::read_to_string(&creds_file) {
-        let mut lines = contents.lines();
-        if let (Some(u), Some(p)) = (lines.next(), lines.next()) {
-            let u_trimmed = u.trim();
-            let p_trimmed = p.trim();
-            if !u_trimmed.is_empty() && !p_trimmed.is_empty() {
-                return (u_trimmed.to_string(), p_trimmed.to_string());
-            }
-        }
+    match config::load_credentials(config_dir) {
+        Ok(c) => (c.username, c.password),
+        Err(_) => (default_user.to_string(), default_pass.to_string()),
     }
-    (default_user.to_string(), default_pass.to_string())
+}
+
+fn epoch_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 /// Runs the autonomous background daemon roaming & re-auth loop.
@@ -62,6 +80,11 @@ pub fn run_daemon(
             let _ = st.save_atomic(&state_path);
         }
     };
+    let log = |msg: &str| {
+        if can_save_state {
+            logger::log(config_dir, msg);
+        }
+    };
 
     let cached_gw_path = config_dir.join("cached_gateway.txt");
     if state.active_gateway.is_none()
@@ -74,19 +97,34 @@ pub fn run_daemon(
         }
     }
 
-    let client = probe::build_fast_client(false).map_err(|e| e.to_string())?;
-    let mut disconnected_ticks: u32 = 0;
+    let probe_client = probe::build_fast_client(false).map_err(|e| e.to_string())?;
+    let login_client = probe::build_login_client().map_err(|e| e.to_string())?;
+
     let mut first_tick = true;
     let mut next_allowed_probe_epoch: u64 = 0;
+    let mut reconnect_countdown: u32 = RECONNECT_MIN_TICKS;
+    let mut reconnect_interval: u32 = RECONNECT_MIN_TICKS;
+    let mut last_tick_epoch: u64 = 0;
+
+    log(&format!(
+        "Daemon started (pid {}{}{})",
+        std::process::id(),
+        if once { ", once" } else { "" },
+        if dry_run { ", dry-run" } else { "" }
+    ));
 
     loop {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+        let now = epoch_now();
 
         let mut force_probe = once || first_tick;
         first_tick = false;
+
+        // Suspend/resume: the wall clock jumped far more than one tick.
+        if last_tick_epoch != 0 && now.saturating_sub(last_tick_epoch) > WAKE_GAP_SECS {
+            log("Wake from sleep detected; re-checking the network");
+            force_probe = true;
+            next_allowed_probe_epoch = 0;
+        }
 
         // Live reset of circuit breaker if reset on disk via `ccp set`
         if state.halted_bad_credentials {
@@ -94,8 +132,10 @@ pub fn run_daemon(
             if !disk_state.halted_bad_credentials {
                 state.halted_bad_credentials = false;
                 state.failure_streak = 0;
+                state.still_locked_streak = 0;
                 force_probe = true;
                 next_allowed_probe_epoch = 0;
+                log("Credentials updated; automatic login resumed");
             }
         }
 
@@ -105,27 +145,41 @@ pub fn run_daemon(
         match local_ip {
             None => {
                 state.last_local_ip = None;
-                disconnected_ticks += 1;
-                // Every 5 ticks (~10s), attempt Wi-Fi reconnection if disconnected
-                if disconnected_ticks >= 5 {
-                    disconnected_ticks = 0;
-                    if !dry_run {
-                        let _ = wifi::connect_wifi(None);
+                reconnect_countdown = reconnect_countdown.saturating_sub(1);
+                // Only ever touches Wi-Fi networks the user allowed (`ccp wifi add`).
+                if reconnect_countdown == 0 {
+                    reconnect_countdown = reconnect_interval;
+                    let ssids = Settings::load(config_dir).wifi_ssids;
+                    if !dry_run && !ssids.is_empty() {
+                        log(&format!(
+                            "No network; trying allowed Wi-Fi: {}",
+                            ssids.join(", ")
+                        ));
+                        let _ = wifi::connect_allowed(&ssids);
                         if let Some(ip) =
                             wifi::wait_for_ipv4(Duration::from_secs(5), Duration::from_millis(200))
                         {
                             state.last_local_ip = Some(ip.to_string());
                             force_probe = true;
                             next_allowed_probe_epoch = 0;
+                            reconnect_interval = RECONNECT_MIN_TICKS;
+                        } else {
+                            reconnect_interval = (reconnect_interval * 2).min(RECONNECT_MAX_TICKS);
+                            reconnect_countdown = reconnect_interval;
                         }
                     }
                 }
             }
             Some(ip) => {
-                disconnected_ticks = 0;
+                reconnect_countdown = RECONNECT_MIN_TICKS;
+                reconnect_interval = RECONNECT_MIN_TICKS;
                 let ip_str = ip.to_string();
                 if state.last_local_ip.as_deref() != Some(&ip_str) {
                     // Subnet Roam / Wake-from-Sleep Detected!
+                    log(&format!(
+                        "Network change: {} -> {ip_str}",
+                        state.last_local_ip.as_deref().unwrap_or("none")
+                    ));
                     state.last_local_ip = Some(ip_str);
                     force_probe = true;
                     next_allowed_probe_epoch = 0;
@@ -146,10 +200,14 @@ pub fn run_daemon(
                 state.active_gateway.as_deref()
             };
 
-            let probe_res = probe::probe_network(&client, fallback_gw);
+            let probe_res = probe::probe_network(&probe_client, fallback_gw);
             match probe_res {
                 ProbeResult::OnlineUnlocked => {
+                    if state.last_status_message != "Online and unlocked" {
+                        log("Online");
+                    }
                     state.failure_streak = 0;
+                    state.still_locked_streak = 0;
                     state.last_status_message = "Online and unlocked".to_string();
                     save_state(&state);
                 }
@@ -170,64 +228,83 @@ pub fn run_daemon(
                         state.last_status_message =
                             "Halted due to bad credentials. Run 'ccp set'.".to_string();
                         save_state(&state);
+                    } else if let Verdict::Untrusted { host } =
+                        trust::check(config_dir, &login_xml_url)
+                    {
+                        // Never send credentials to a portal the user hasn't approved.
+                        if state.pending_untrusted_gateway.as_deref() != Some(&host) {
+                            log(&format!(
+                                "Blocked login: portal host {host} is not trusted (run 'ccp trust {host}')"
+                            ));
+                        }
+                        state.last_status_message = format!(
+                            "Blocked: portal host {host} is not trusted. Run 'ccp trust {host}'."
+                        );
+                        state.pending_untrusted_gateway = Some(host);
+                        save_state(&state);
                     } else {
                         let (cur_user, cur_pass) =
                             load_latest_credentials(config_dir, username, password);
-                        match probe::post_login(&client, &login_xml_url, &cur_user, &cur_pass) {
+                        log(&format!("Portal at {gateway_base}; logging in"));
+                        match probe::login_and_verify(
+                            &login_client,
+                            &probe_client,
+                            &login_xml_url,
+                            &cur_user,
+                            &cur_pass,
+                        ) {
                             Ok(_) => {
                                 state.failure_streak = 0;
+                                state.still_locked_streak = 0;
                                 state.total_logins += 1;
                                 state.last_login_epoch = now;
                                 state.active_gateway = Some(login_xml_url.clone());
+                                state.pending_untrusted_gateway = None;
                                 state.last_status_message =
                                     format!("Authenticated at {gateway_base}");
                                 next_allowed_probe_epoch = 0;
+                                log(&format!("Login verified at {gateway_base}"));
                                 save_state(&state);
                                 if can_save_state {
                                     let _ = std::fs::write(&cached_gw_path, &login_xml_url);
                                 }
                             }
-                            Err(e) => {
-                                let err_str = e.to_string();
-                                let err_lower = err_str.to_lowercase();
-                                let is_credential_err = [
-                                    "invalid username",
-                                    "invalid user name",
-                                    "invalid password",
-                                    "incorrect password",
-                                    "wrong password",
-                                    "invalid credentials",
-                                    "make sure your password is correct",
-                                    "authentication failed",
-                                    "login failed",
-                                    "account expired",
-                                    "access denied",
-                                    "portal returned fail status",
-                                ]
-                                .iter()
-                                .any(|k| err_lower.contains(k));
-
-                                if is_credential_err {
+                            Err(LoginError::BadCredentials(msg)) => {
+                                state.halted_bad_credentials = true;
+                                state.failure_streak += 1;
+                                state.last_status_message =
+                                    format!("Halted (bad credentials): {msg}");
+                                log(&format!("Halted: {msg}"));
+                                save_state(&state);
+                            }
+                            Err(LoginError::StillLocked) => {
+                                state.still_locked_streak += 1;
+                                state.failure_streak += 1;
+                                if state.still_locked_streak >= MAX_STILL_LOCKED {
+                                    // Re-submitting forever risks a campus lockout.
                                     state.halted_bad_credentials = true;
-                                    state.failure_streak += 1;
-                                    state.last_status_message =
-                                        format!("Halted (bad credentials): {err_str}");
-                                    save_state(&state);
-                                } else {
-                                    state.failure_streak += 1;
                                     state.last_status_message = format!(
-                                        "Login failed (attempt {}): {err_str}",
-                                        state.failure_streak
+                                        "Halted: the portal accepted the login {} times but the internet stayed locked. Check your credentials with 'ccp set'.",
+                                        state.still_locked_streak
                                     );
-                                    save_state(&state);
-
-                                    // Exponential backoff up to 300s (non-blocking)
-                                    let backoff = 300u64.min(
-                                        5 * (1u64
-                                            << (state.failure_streak.saturating_sub(1).min(6))),
+                                } else {
+                                    state.last_status_message = format!(
+                                        "Login accepted but internet still locked (attempt {}/{MAX_STILL_LOCKED})",
+                                        state.still_locked_streak
                                     );
-                                    next_allowed_probe_epoch = now + backoff;
+                                    next_allowed_probe_epoch =
+                                        now + backoff_secs(state.failure_streak);
                                 }
+                                log(&state.last_status_message);
+                                save_state(&state);
+                            }
+                            Err(e) => {
+                                state.failure_streak += 1;
+                                state.last_status_message =
+                                    format!("Login failed (attempt {}): {e}", state.failure_streak);
+                                log(&state.last_status_message);
+                                save_state(&state);
+                                next_allowed_probe_epoch = now + backoff_secs(state.failure_streak);
                             }
                         }
                     }
@@ -249,7 +326,8 @@ pub fn run_daemon(
             return Ok(());
         }
 
-        std::thread::sleep(Duration::from_secs(2));
+        last_tick_epoch = epoch_now();
+        std::thread::sleep(TICK);
     }
 }
 
@@ -259,10 +337,6 @@ pub fn start_background_daemon(config_dir: &Path) -> Result<(), String> {
     if instance::is_daemon_running(&lock_path) {
         println!("ccp daemon is already running.");
         return Ok(());
-    }
-
-    if lock_path.exists() {
-        let _ = std::fs::remove_file(&lock_path);
     }
 
     let exe = std::env::current_exe().map_err(|e| format!("Failed to get exe path: {e}"))?;
@@ -275,21 +349,28 @@ pub fn start_background_daemon(config_dir: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
 
-    cmd.spawn()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| format!("Failed to spawn background daemon: {e}"))?;
 
-    // Poll every 25ms up to 20 times (500ms max) for lock acquisition
+    // Poll every 50ms for up to 2s for the lock (antivirus can slow first launch).
     let mut started = false;
-    for _ in 0..20 {
+    for _ in 0..40 {
         if instance::is_daemon_running(&lock_path) {
             started = true;
             break;
         }
-        std::thread::sleep(Duration::from_millis(25));
+        if let Ok(Some(_)) = child.try_wait() {
+            break; // exited already
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
 
     if !started {
-        return Err("Background daemon exited prematurely before acquiring lock.".to_string());
+        return Err(
+            "Background daemon exited prematurely before acquiring lock. See 'ccp logs'."
+                .to_string(),
+        );
     }
 
     println!("Background daemon started successfully.");
@@ -306,59 +387,57 @@ pub fn stop_daemon(config_dir: &Path) -> Result<(), String> {
         return Ok(());
     }
 
-    // Authoritatively read PID from daemon.lock first, falling back to state.json
-    let mut pid = 0;
-    if lock_path.exists()
-        && let Ok(c) = std::fs::read_to_string(&lock_path)
-    {
-        pid = c.trim().parse::<u32>().unwrap_or(0);
-    }
+    // The PID in daemon.lock is authoritative while the lock is held; state.json is the fallback.
+    let pid = instance::read_lock_pid(&lock_path)
+        .or_else(|| Some(DaemonState::load(&state_path).pid).filter(|p| *p > 0));
 
-    if pid == 0 {
-        let state = DaemonState::load(&state_path);
-        pid = state.pid;
-    }
-
-    if pid > 0 {
-        #[cfg(target_os = "windows")]
-        {
-            let mut cmd = std::process::Command::new("taskkill");
-            cmd.args([
-                "/PID",
-                &pid.to_string(),
-                "/FI",
-                "IMAGENAME eq ccp.exe",
-                "/F",
-            ])
-            .creation_flags(CREATE_NO_WINDOW);
-            let _ = cmd.output();
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            if instance::is_ccp_pid_alive(&pid.to_string()) {
-                let _ = std::process::Command::new("kill")
-                    .arg(pid.to_string())
-                    .output();
-            }
-        }
-
-        // Poll every 50ms up to 500ms for OS process to fully terminate and release kernel handle
-        for _ in 0..10 {
-            if !instance::is_daemon_running(&lock_path) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-
-        println!("Daemon (PID {pid}) stopped.");
-    } else {
+    let Some(pid) = pid else {
         println!("Unable to determine PID of running daemon.");
+        return Ok(());
+    };
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args([
+            "/PID",
+            &pid.to_string(),
+            "/FI",
+            "IMAGENAME eq ccp.exe",
+            "/F",
+        ])
+        .creation_flags(CREATE_NO_WINDOW);
+        let _ = cmd.output();
     }
 
-    if !instance::is_daemon_running(&lock_path) {
-        let _ = std::fs::remove_file(&lock_path);
+    #[cfg(not(target_os = "windows"))]
+    {
+        // The flock proves this PID is the live daemon, so it can't be a recycled PID.
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .output();
     }
+
+    // Poll every 50ms up to 2s for the OS to fully terminate it and release the lock
+    for _ in 0..40 {
+        if !instance::is_daemon_running(&lock_path) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    if instance::is_daemon_running(&lock_path) {
+        return Err(format!("Daemon (PID {pid}) did not stop."));
+    }
+
+    #[cfg(target_os = "windows")]
+    let _ = std::fs::remove_file(&lock_path);
+
+    logger::log(
+        config_dir,
+        &format!("Daemon (pid {pid}) stopped by 'ccp stop'"),
+    );
+    println!("Daemon (PID {pid}) stopped.");
     Ok(())
 }
 
@@ -376,6 +455,10 @@ pub fn print_status(config_dir: &Path) {
     } else {
         "Normal (Active)"
     };
+
+    let store = TrustStore::open(config_dir);
+    let trusted = store.hosts();
+    let ssids = Settings::load(config_dir).wifi_ssids;
 
     println!("CCP Daemon Status");
     println!("-----------------");
@@ -395,8 +478,37 @@ pub fn print_status(config_dir: &Path) {
             .unwrap_or("None (Undiscovered)")
     );
     println!("Total Logins:     {}", state.total_logins);
+    if state.last_login_epoch > 0 {
+        println!(
+            "Last Login:       {}",
+            logger::format_utc(state.last_login_epoch)
+        );
+    }
     println!("Failure Streak:   {}", state.failure_streak);
     println!("Circuit Breaker:  {breaker_str}");
+    println!(
+        "Trusted Portals:  {}",
+        if trusted.is_empty() {
+            "none yet (run 'ccp' once on campus Wi-Fi to approve one)".to_string()
+        } else {
+            trusted.join(", ")
+        }
+    );
+    if let Some(pending) = state
+        .pending_untrusted_gateway
+        .as_deref()
+        .filter(|h| !store.is_trusted(h))
+    {
+        println!("Blocked Portal:   {pending}  ->  run 'ccp trust {pending}' to allow it");
+    }
+    println!(
+        "Wi-Fi Auto-join:  {}",
+        if ssids.is_empty() {
+            "off (enable with 'ccp wifi add <SSID>')".to_string()
+        } else {
+            ssids.join(", ")
+        }
+    );
     println!(
         "Last Status:      {}",
         if state.last_status_message.is_empty() {

@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::Path;
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone, PartialEq, Eq)]
+#[serde(default)] // older state.json files (missing newer fields) keep loading
 pub struct DaemonState {
     pub pid: u32,
     pub last_probe_epoch: u64,
@@ -11,9 +12,14 @@ pub struct DaemonState {
     pub active_gateway: Option<String>,
     pub last_local_ip: Option<String>,
     pub failure_streak: u32,
+    /// Consecutive "portal said OK but the internet stayed locked" results. Persisted so
+    /// a restarting daemon can't reset the safety net and resubmit forever.
+    pub still_locked_streak: u32,
     pub halted_bad_credentials: bool,
     pub last_status_message: String,
     pub total_logins: u64,
+    /// Portal host that was found but not trusted yet (see `ccp trust`).
+    pub pending_untrusted_gateway: Option<String>,
 }
 
 impl DaemonState {
@@ -54,6 +60,15 @@ impl DaemonState {
         Ok(())
     }
 
+    /// Pauses all automatic logins until `ccp set` stores new credentials.
+    pub fn mark_bad_credentials(path: &Path, message: &str) {
+        let mut state = Self::load(path);
+        state.halted_bad_credentials = true;
+        state.failure_streak += 1;
+        state.last_status_message = message.to_string();
+        let _ = state.save_atomic(path);
+    }
+
     /// Resets the circuit breaker when new credentials are saved
     pub fn reset_circuit_breaker(path: &Path) {
         if !path.exists() {
@@ -63,6 +78,7 @@ impl DaemonState {
         let mut state = Self::load(path);
         state.halted_bad_credentials = false;
         state.failure_streak = 0;
+        state.still_locked_streak = 0;
         state.last_status_message = "Circuit breaker reset via 'ccp set'.".to_string();
         let _ = state.save_atomic(path);
     }
@@ -71,6 +87,40 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn old_state_files_without_new_fields_still_load() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ccp_test_state_old_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let path = tmp_dir.join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"pid": 7, "total_logins": 3, "halted_bad_credentials": true}"#,
+        )
+        .unwrap();
+        let state = DaemonState::load(&path);
+        assert_eq!(state.pid, 7);
+        assert_eq!(state.total_logins, 3);
+        assert!(state.halted_bad_credentials);
+        assert_eq!(state.pending_untrusted_gateway, None);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn mark_bad_credentials_halts_and_reset_clears() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("ccp_test_state_halt_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let path = tmp_dir.join("state.json");
+        DaemonState::mark_bad_credentials(&path, "Portal rejected login: Invalid password");
+        let s = DaemonState::load(&path);
+        assert!(s.halted_bad_credentials);
+        assert_eq!(s.failure_streak, 1);
+        DaemonState::reset_circuit_breaker(&path);
+        assert!(!DaemonState::load(&path).halted_bad_credentials);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 
     #[test]
     fn test_daemon_state_atomic_save_load_reset() {
@@ -85,9 +135,11 @@ mod tests {
             active_gateway: Some("http://172.16.68.6:8090".to_string()),
             last_local_ip: Some("172.16.68.10".to_string()),
             failure_streak: 5,
+            still_locked_streak: 2,
             halted_bad_credentials: true,
             last_status_message: "Halted".to_string(),
             total_logins: 3,
+            pending_untrusted_gateway: Some("10.9.9.9".to_string()),
         };
 
         // Save

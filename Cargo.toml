@@ -1,7 +1,10 @@
 [package]
 name = "ccp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.89"
+description = "Campus captive portal auto-authenticator (CLI + background daemon)"
+readme = "README.md"
 
 [dependencies]
 rpassword = "7"
@@ -11,3 +14,8 @@ url = "2.5"
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
